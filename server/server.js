@@ -12,6 +12,10 @@ const PORT = process.env.PORT || 5000;
 const PAYPAL_API = "https://api-m.sandbox.paypal.com";
 const GEMINI_MODEL = "gemini-3.8-flash";
 
+const FRONTEND_URL = (
+  process.env.CLIENT_URL || "http://localhost:5173"
+).replace(/\/+$/, "");
+
 let geminiClient = null;
 
 // ------------------------------------------
@@ -38,9 +42,22 @@ async function getGeminiClient() {
 // GENERAL MIDDLEWARE
 // ------------------------------------------
 
+const allowedOrigins = [
+  "http://localhost:5173",
+  process.env.CLIENT_URL,
+]
+  .filter(Boolean)
+  .map((origin) => origin.replace(/\/+$/, ""));
+
 app.use(
   cors({
-    origin: process.env.CLIENT_URL || "http://localhost:5173",
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      return callback(new Error("Not allowed by CORS"));
+    },
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
@@ -236,141 +253,127 @@ app.get("/api/health", (req, res) => {
 // CURRENT USER PROFILE
 // ------------------------------------------
 
-app.get(
-  "/api/profile",
-  requireAuth,
-  async (req, res) => {
-    try {
-      const { data: profile, error } = await supabase
-        .from("profiles")
-        .select("id, email, role, created_at")
-        .eq("id", req.user.id)
-        .maybeSingle();
+app.get("/api/profile", requireAuth, async (req, res) => {
+  try {
+    const { data: profile, error } = await supabase
+      .from("profiles")
+      .select("id, email, role, created_at")
+      .eq("id", req.user.id)
+      .maybeSingle();
 
-      if (error) throw error;
+    if (error) throw error;
 
-      if (!profile) {
-        return res.status(404).json({
-          success: false,
-          message: "Account profile not found.",
-        });
-      }
-
-      res.status(200).json({
-        success: true,
-        profile: {
-          id: profile.id,
-          email: profile.email || req.user.email,
-          role: profile.role,
-          created_at: profile.created_at,
-        },
-      });
-    } catch (error) {
-      console.error("Profile fetch error:", error.message);
-
-      res.status(500).json({
+    if (!profile) {
+      return res.status(404).json({
         success: false,
-        message: "Unable to load your profile.",
+        message: "Account profile not found.",
       });
     }
+
+    res.status(200).json({
+      success: true,
+      profile: {
+        id: profile.id,
+        email: profile.email || req.user.email,
+        role: profile.role,
+        created_at: profile.created_at,
+      },
+    });
+  } catch (error) {
+    console.error("Profile fetch error:", error.message);
+
+    res.status(500).json({
+      success: false,
+      message: "Unable to load your profile.",
+    });
   }
-);
+});
 
 // ------------------------------------------
 // GET INVOICES BY ACCOUNT ROLE
 // ------------------------------------------
 
-app.get(
-  "/api/invoices",
-  requireAuth,
-  async (req, res) => {
-    try {
-      const { data: profile, error: profileError } = await supabase
-        .from("profiles")
-        .select("role")
-        .eq("id", req.user.id)
-        .maybeSingle();
+app.get("/api/invoices", requireAuth, async (req, res) => {
+  try {
+    const { data: profile, error: profileError } = await supabase
+      .from("profiles")
+      .select("role")
+      .eq("id", req.user.id)
+      .maybeSingle();
 
-      if (profileError) throw profileError;
+    if (profileError) throw profileError;
 
-      if (!profile || !["developer", "client"].includes(profile.role)) {
+    if (!profile || !["developer", "client"].includes(profile.role)) {
+      return res.status(403).json({
+        success: false,
+        message: "Account role not found or invalid.",
+      });
+    }
+
+    let query = supabase.from("invoices").select("*");
+
+    if (profile.role === "developer") {
+      query = query.eq("user_id", req.user.id);
+    }
+
+    if (profile.role === "client") {
+      const verifiedEmail =
+        req.user.email_confirmed_at || req.user.confirmed_at;
+
+      if (!verifiedEmail) {
         return res.status(403).json({
           success: false,
-          message: "Account role not found or invalid.",
+          message:
+            "Please verify your email address before viewing invoices.",
         });
       }
 
-      let query = supabase
+      const normalizedEmail = (req.user.email || "")
+        .trim()
+        .toLowerCase();
+
+      if (!normalizedEmail) {
+        return res.status(400).json({
+          success: false,
+          message: "Your account email is missing.",
+        });
+      }
+
+      const { error: claimError } = await supabase
         .from("invoices")
-        .select("*");
+        .update({
+          client_user_id: req.user.id,
+        })
+        .ilike("email", normalizedEmail)
+        .is("client_user_id", null)
+        .neq("user_id", req.user.id);
 
-      // Developer: only invoices created by this developer.
-      if (profile.role === "developer") {
-        query = query.eq("user_id", req.user.id);
-      }
+      if (claimError) throw claimError;
 
-      // Client: only verified invoices assigned to this client.
-      if (profile.role === "client") {
-        const verifiedEmail =
-          req.user.email_confirmed_at || req.user.confirmed_at;
-
-        if (!verifiedEmail) {
-          return res.status(403).json({
-            success: false,
-            message:
-              "Please verify your email address before viewing invoices.",
-          });
-        }
-
-        const normalizedEmail = (req.user.email || "")
-          .trim()
-          .toLowerCase();
-
-        if (!normalizedEmail) {
-          return res.status(400).json({
-            success: false,
-            message: "Your account email is missing.",
-          });
-        }
-
-        // Automatically link unassigned invoices sent to this email.
-        const { error: claimError } = await supabase
-          .from("invoices")
-          .update({
-            client_user_id: req.user.id,
-          })
-          .ilike("email", normalizedEmail)
-          .is("client_user_id", null)
-          .neq("user_id", req.user.id);
-
-        if (claimError) throw claimError;
-
-        query = query.eq("client_user_id", req.user.id);
-      }
-
-      const { data, error } = await query.order(
-        "created_at",
-        { ascending: false }
-      );
-
-      if (error) throw error;
-
-      res.status(200).json({
-        success: true,
-        role: profile.role,
-        count: data.length,
-        invoices: data.map(formatInvoice),
-      });
-    } catch (error) {
-      console.error("Fetch invoices error:", error.message);
-
-      res.status(500).json({
-        success: false,
-        message: "Unable to fetch your invoices.",
-      });
+      query = query.eq("client_user_id", req.user.id);
     }
+
+    const { data, error } = await query.order("created_at", {
+      ascending: false,
+    });
+
+    if (error) throw error;
+
+    res.status(200).json({
+      success: true,
+      role: profile.role,
+      count: data.length,
+      invoices: data.map(formatInvoice),
+    });
+  } catch (error) {
+    console.error("Fetch invoices error:", error.message);
+
+    res.status(500).json({
+      success: false,
+      message: "Unable to fetch your invoices.",
+    });
   }
-);
+});
 
 // ------------------------------------------
 // CREATE INVOICE - DEVELOPER ONLY
@@ -654,10 +657,10 @@ app.post(
             user_action: "PAY_NOW",
             return_url:
               process.env.PAYPAL_RETURN_URL ||
-              "http://localhost:5173/payment-success",
+              `${FRONTEND_URL}/payment-success`,
             cancel_url:
               process.env.PAYPAL_CANCEL_URL ||
-              "http://localhost:5173/payment-cancel",
+              `${FRONTEND_URL}/payment-cancel`,
           },
         },
         {
@@ -876,11 +879,11 @@ async function startServer() {
       throw new Error("GEMINI_API_KEY missing in server/.env");
     }
 
-    app.listen(PORT, () => {
+    app.listen(PORT, "0.0.0.0", () => {
       console.log("--------------------------------");
       console.log("          PAYFLOW AI");
       console.log("--------------------------------");
-      console.log(`Server running: http://localhost:${PORT}`);
+      console.log(`Server running on port ${PORT}`);
       console.log("Supabase authentication enabled.");
       console.log("Developer and Client roles enabled.");
       console.log("Developer invoice isolation enabled.");

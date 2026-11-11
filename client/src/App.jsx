@@ -3,7 +3,10 @@ import { useEffect, useMemo, useState } from "react";
 import "./App.css";
 import { supabase } from "./supabase";
 
-const API_URL = "http://localhost:5000";
+// Production API URL from Render environment variable.
+// Local development continues to use localhost.
+const API_URL =
+  import.meta.env.VITE_API_URL || "http://localhost:5000";
 
 const developerNavItems = [
   { icon: "⌂", label: "Overview" },
@@ -1700,9 +1703,6 @@ function App() {
   // ------------------------------------------
   // PAGE ROUTER
   // ------------------------------------------
-
-  // Direct function calls prevent nested page components
-  // from remounting and losing input focus.
 
   function renderPage() {
     if (isClient) {
